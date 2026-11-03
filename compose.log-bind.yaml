@@ -1,0 +1,11 @@
+# Compose overlay that bind-mounts Samba logs to a host path (SMB_LOG_HOST_PATH),
+# used to persist logs outside the container. Selected automatically by
+# smb.sh; do not pass this to `docker compose -f` on its own.
+services:
+  samba:
+    volumes:
+      - type: bind
+        source: ${SMB_LOG_HOST_PATH:?}
+        target: ${SMB_LOG_DIR:?}
+        bind:
+          create_host_path: false

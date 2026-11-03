@@ -1,0 +1,122 @@
+# All values come from config.env. Start with: ./smb.sh up -d
+# Log mount is NOT declared here: smb.sh picks compose.log-bind.yaml or compose.log-volume.yaml as a second -f file depending on SMB_LOG_HOST_PATH.
+
+services:
+  samba:
+    # Locally built image: entrypoint.sh is baked in by the Dockerfile, so no host file has to exist at start time. SMB_BASE_IMAGE is the pinned upstream.
+    image: ${SMB_IMAGE:?}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${SMB_BASE_IMAGE:?}
+    entrypoint: ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+    container_name: ${SMB_CONTAINER_NAME:?}
+    hostname: ${SMB_HOSTNAME:?}
+    restart: ${SMB_RESTART_POLICY:?}
+    env_file:
+      - config.env
+      - secrets.env
+    ports:
+      - "${SMB_BIND_IP:?}:${SMB_HOST_PORT:?}:445/tcp"
+    volumes:
+      - type: bind
+        source: ${SHARE_HOST_PATH_1st:?}
+        target: ${SHARE_CONTAINER_PATH_1st:?}
+        read_only: ${SHARE_MOUNT_READ_ONLY_1st:?}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SHARE_HOST_PATH_2nd:?}
+        target: ${SHARE_CONTAINER_PATH_2nd:?}
+        read_only: ${SHARE_MOUNT_READ_ONLY_2nd:?}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CONTAINER_LOG_HOST_PATH:?}
+        target: ${CONTAINER_LOG_DIR:?}
+        bind:
+          create_host_path: false
+      # Samba state (passdb.tdb, secrets.tdb). Survives down/up and --force-recreate;
+      # removed only by `docker compose down -v`.
+      - type: volume
+        source: samba_private
+        target: /var/lib/samba/private
+      # Declarative runtime state written by smbctl: dynamic.conf (share blocks)
+      # and accounts.tsv (users + groups). Same lifecycle as samba_private.
+      - type: volume
+        source: samba_core
+        target: ${SMB_STATE_DIR:?}
+    deploy:
+      resources:
+        limits:
+          cpus: "${SMB_CPU_LIMIT:?}"
+          memory: ${SMB_MEM_LIMIT:?}
+          pids: ${SMB_PIDS_LIMIT:?}
+        reservations:
+          memory: ${SMB_MEM_RESERVATION:?}
+    ulimits:
+      nofile:
+        soft: ${SMB_NOFILE_SOFT:?}
+        hard: ${SMB_NOFILE_HARD:?}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 445 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Admin API: the only process that touches docker.sock.
+  # It execs `smbctl` inside smb-pod (container name hardcoded in the binary) and never calls /containers/create, /stop, /kill, /restart or DELETE /containers.
+  # Adding this service does NOT touch any volumes:/ports:/env_file: of `samba`, so `./smb.sh up -d` creates smb-admin without recreating smb-pod.
+  smb-admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    image: ${ADMIN_IMAGE:?}
+    container_name: smb-admin
+    hostname: smb-admin
+    restart: ${SMB_RESTART_POLICY:?}
+    # The process listens on 8333 inside the container (never a privileged port,
+    # so it works on any host regardless of net.ipv4.ip_unprivileged_port_start);
+    # Docker binds ADMIN_API_PORT on the host loopback. 
+    # No cap_add is needed — NET_BIND_SERVICE is already in Docker's default bounding set and is a no-op for a non-root process anyway (execution-plan.md F1).
+    ports:
+      - "127.0.0.1:${ADMIN_API_PORT:?}:8333/tcp"
+    volumes:
+      # No `:ro` — read-only applies to the socket *file*, not to what can be sent over it, so it buys nothing. The narrow surface is this service itself.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${CONTAINER_LOG_HOST_PATH:?}
+        target: ${CONTAINER_LOG_DIR:?}
+        bind:
+          create_host_path: false
+    env_file:
+      - config.env
+      - secrets.env
+    # Runs as uid 10001 (see admin/Dockerfile).
+    # On Docker Desktop the socket is root:root mode 0660, so the supplementary group 0 is what makes it readable without running the process as root.
+    group_add:
+      - "0"
+    depends_on:
+      - samba
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+          pids: 64
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8333/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  # Explicit `name:` on every volume: COMPOSE_PROJECT_NAME (currently "test") would otherwise prefix them (test_samba_core),
+  # and `docker run -v samba_core:...` used for seeding would then silently create a *different*, empty volume.
+  samba_private:
+    name: samba_private
+  samba_core:
+    name: samba_core

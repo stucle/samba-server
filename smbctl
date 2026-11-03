@@ -1,0 +1,410 @@
+#!/bin/sh
+# Runtime admin CLI for this Samba container.
+# Baked into the image by the Dockerfile; run it with `docker exec smb-pod smbctl <cmd> ...`
+# (or through the Admin API, which execs exactly this binary with an argv array).
+#
+# Every mutation does two things at once:
+# it writes the declarative state on the persistent samba_core volume ($SMB_STATE_DIR) and it takes effect live.
+#There is no third artifact to keep in sync:
+#
+#   dynamic.conf   share blocks, `include`d at the end of smb.conf by entrypoint.sh.
+#                  Written atomically and validated with testparm BEFORE it replaces the live file, so smb.conf is never invalid and `reload-config` never reads a half-written file.
+#   accounts.tsv   users + group membership, 
+#                  replayed by entrypoint.sh at start because /etc/passwd and /etc/group live in the container layer.
+#                  No passwords (they are in passdb.tdb, volume samba_private) and no UIDs (every share forces `force user`, so a runtime user's UID never reaches the host filesystem).
+#
+# Concurrency: one mkdir-based mutex for the whole state directory.
+set -eu
+
+STATE_DIR=${SMB_STATE_DIR:-/var/lib/samba/state}
+DYNAMIC="$STATE_DIR/dynamic.conf"
+ACCOUNTS="$STATE_DIR/accounts.tsv"
+LOCK="$STATE_DIR/.lock"
+CONF=/etc/samba/smb.conf
+
+# Sharepoints are subdirectories of share #1's mount: "one bind mount = many sharepoints",
+# which is what makes creating one at runtime possible at all (Docker cannot add a mount to a running container).
+SHARE_ROOT=${SHARE_CONTAINER_PATH_1st:-/shares/onpremise}
+WRITE_USER=${SMB_WRITE_USER:-groot}
+READ_USER=${SMB_READ_USER:-readonly}
+MAX_CONNECTIONS=${SMB_MAX_CONNECTIONS:-0}
+CREATE_MASK=${SHARE_CREATE_MASK_1st:-0664}
+DIRECTORY_MASK=${SHARE_DIRECTORY_MASK_1st:-0775}
+VETO_FILES=${SHARE_VETO_FILES_1st:-}
+DELETE_VETO_FILES=${SHARE_DELETE_VETO_FILES_1st:-no}
+
+log()  { echo "[smbctl] $*"; }
+warn() { echo "[smbctl] WARNING: $*" >&2; }
+die()  { echo "[smbctl] ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: smbctl <command> [args]
+
+  onboard <user> <password> [group]   create an SMB account (optionally in <group>)
+  offboard <user>                     disable, cut live sessions, delete the account
+  sharepoint-create <name>            new subdir of the share root + its two groups + share block
+  grant <user> <share> r|rw           r = read only, rw = read and write
+  revoke <user> <share> [w|all]       w (default) = drop write, keep read; all = drop both
+  state-dump                          print dynamic.conf and accounts.tsv
+
+Names must match ^[a-z0-9_-]{1,32}$ (sharepoints: 26 chars, the sp_<name>_[rw]
+group names have to fit too). Everything here ends up in smb.conf, adduser and
+addgroup, so the check is deliberately strict.
+USAGE
+  exit 1
+}
+
+# --- validation -------------------------------------------------------------
+# Rejects anything that could be read as a flag by adduser/addgroup or as syntax by smb.conf.
+# Called for EVERY name, including when invoked by hand: the Admin API is not the only caller, so it cannot be the only place that validates.
+valid_name() {
+  case $1 in
+    '' | -* | *[!a-z0-9_-]*) return 1 ;;
+  esac
+  [ "${#1}" -le "${2:-32}" ]
+}
+
+require_name() {
+  valid_name "$2" "${3:-32}" \
+    || die "invalid $1 '$2': expected ^[a-z0-9_-]{1,${3:-32}}$"
+}
+
+# --- locking ----------------------------------------------------------------
+# mkdir is atomic on every POSIX filesystem, so it works as a mutex without flock (busybox has no flock applet in this image).
+acquire_lock() {
+  tries=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || die "another smbctl run holds $LOCK; remove it if it is stale"
+    sleep 0.1
+  done
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+}
+
+# --- state: dynamic.conf ----------------------------------------------------
+# Reads the complete new dynamic.conf on stdin, validates it in place of the live one, and only then moves it over. mv within one filesystem is atomic.
+#
+# With two extra arguments it also asserts a postcondition: that <section> really parses as a service whose `path` is <path>.
+#That matters because `testparm` alone is a weak gate — measured 2026-11-03,
+# it exits non-zero only for a bad value of a known parameter ("read only = maybe") or a structurally broken section header ("[unclosed"),
+# i.e. exactly the two cases that stop smbd from starting.
+# Junk lines, a parameter without "=", and duplicate sections are only warnings and exit 0,
+# so without this assertion a block could be committed and silently not become a usable share.
+commit_dynamic() {
+  expect_section=${1:-}
+  expect_path=${2:-}
+
+  grep -q "^include = " "$CONF" \
+    || die "$CONF has no 'include' line: the image predates the dynamic-state entrypoint"
+
+  tmp="$DYNAMIC.tmp.$$"
+  draft="/tmp/smbctl-draft.$$.conf"
+  cat > "$tmp"
+  sed "s|^include = .*|include = $tmp|" "$CONF" > "$draft"
+
+  if ! errors=$(testparm -s "$draft" 2>&1 >/dev/null); then
+    rm -f "$tmp" "$draft"
+    die "refusing to write $DYNAMIC, the resulting config does not validate:
+$errors"
+  fi
+
+  # Warnings do not block (Samba itself only warns), but they must not be silent:
+  # they are how a hand-edited junk line in dynamic.conf becomes visible.
+  complaints=$(testparm -s "$draft" 2>&1 >/dev/null \
+    | grep -iE 'unknown parameter|badly formed|no path in service' || true)
+  [ -z "$complaints" ] || warn "testparm complains about the current $DYNAMIC: $complaints"
+
+  if [ -n "$expect_section" ]; then
+    got=$(testparm -s --section-name "$expect_section" --parameter-name path "$draft" 2>/dev/null)
+    if [ "$got" != "$expect_path" ]; then
+      rm -f "$tmp" "$draft"
+      die "refusing to write $DYNAMIC: section [$expect_section] does not parse as a share with path $expect_path (testparm reported '${got:-nothing}')"
+    fi
+  fi
+
+  rm -f "$draft"
+  mv "$tmp" "$DYNAMIC"
+}
+
+reload_samba() {
+  smbcontrol all reload-config >/dev/null 2>&1 \
+    || warn "smbcontrol reload-config failed; the state file is written but smbd still runs the old config"
+}
+
+# True if a share of this name is already declared, statically or dynamically.
+section_present() {
+  grep -q "^\[$1\]" "$CONF" 2>/dev/null && return 0
+  grep -q "^\[$1\]" "$DYNAMIC" 2>/dev/null
+}
+
+share_block() {
+  name=$1
+  cat <<BLOCK
+
+[${name}]
+   path = ${SHARE_ROOT}/${name}
+   comment = sharepoint ${name}
+   read only = no
+   browseable = yes
+   guest ok = no
+   valid users = @sp_${name}_r @sp_${name}_w
+   read list = @sp_${name}_r
+   write list = @sp_${name}_w
+   force user = ${WRITE_USER}
+   force group = ${BASE_GROUP}
+   create mask = ${CREATE_MASK}
+   directory mask = ${DIRECTORY_MASK}
+   max connections = ${MAX_CONNECTIONS}
+   veto files = ${VETO_FILES}
+   delete veto files = ${DELETE_VETO_FILES}
+BLOCK
+}
+
+# --- state: accounts.tsv ----------------------------------------------------
+acct_groups() {        # <user> -> its comma-separated group list ('' if absent)
+  [ -f "$ACCOUNTS" ] || return 0
+  awk -F'\t' -v u="$1" '$1 == u { print $2; exit }' "$ACCOUNTS"
+}
+
+acct_known() {         # <user> -> 0 if the user has a line
+  [ -f "$ACCOUNTS" ] || return 1
+  awk -F'\t' -v u="$1" '$1 == u { found = 1 } END { exit found ? 0 : 1 }' "$ACCOUNTS"
+}
+
+acct_put() {           # <user> <groups> -> upsert the line
+  tmp="$ACCOUNTS.tmp.$$"
+  if [ -f "$ACCOUNTS" ]; then
+    awk -F'\t' -v u="$1" '$1 != u' "$ACCOUNTS" > "$tmp"
+  else
+    printf '# user\tgroups\n' > "$tmp"
+  fi
+  printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" "$ACCOUNTS"
+}
+
+acct_del() {           # <user> -> drop the line
+  [ -f "$ACCOUNTS" ] || return 0
+  tmp="$ACCOUNTS.tmp.$$"
+  awk -F'\t' -v u="$1" '$1 != u' "$ACCOUNTS" > "$tmp"
+  mv "$tmp" "$ACCOUNTS"
+}
+
+list_add() {           # <comma list> <item> -> list with item present
+  for item in $(echo "$1" | tr ',' ' '); do
+    [ "$item" != "$2" ] || { echo "$1"; return 0; }
+  done
+  if [ -z "$1" ]; then echo "$2"; else echo "$1,$2"; fi
+}
+
+list_del() {           # <comma list> <item> -> list without item
+  out=''
+  for item in $(echo "$1" | tr ',' ' '); do
+    [ "$item" != "$2" ] || continue
+    if [ -z "$out" ]; then out=$item; else out="$out,$item"; fi
+  done
+  echo "$out"
+}
+
+# --- unix helpers -----------------------------------------------------------
+# The base group is whatever SMB_GID resolves to (GID 20 is "dialout" on Alpine),
+# matching what entrypoint.sh puts in `force group`.
+BASE_GROUP=$(getent group "${SMB_GID:-}" 2>/dev/null | cut -d: -f1 || true)
+[ -n "$BASE_GROUP" ] || BASE_GROUP=$WRITE_USER
+
+ensure_group() {
+  getent group "$1" >/dev/null 2>&1 || addgroup "$1"
+}
+
+in_group() {           # <user> <group>
+  id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"
+}
+
+protect_base_account() {
+  [ "$1" != "$WRITE_USER" ] && [ "$1" != "$READ_USER" ] \
+    || die "'$1' is a base account from config.env; manage it there, not at runtime"
+}
+
+# --- commands ---------------------------------------------------------------
+cmd_onboard() {
+  [ $# -ge 2 ] && [ $# -le 3 ] || usage
+  user=$1; password=$2; group=${3:-}
+  require_name "user name" "$user"
+  protect_base_account "$user"
+  [ -n "$password" ] || die "password must not be empty"
+  if printf '%s' "$password" | grep -q '[[:cntrl:]]'; then
+    die "password must not contain control characters"
+  fi
+  [ -z "$group" ] || require_name "group name" "$group"
+
+  acquire_lock
+  ! id "$user" >/dev/null 2>&1 || die "unix user '$user' already exists"
+
+  adduser -D -H -s /sbin/nologin -G "$BASE_GROUP" "$user"
+  printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -a "$user" >/dev/null
+  smbpasswd -e "$user" >/dev/null
+
+  if [ -n "$group" ]; then
+    ensure_group "$group"
+    adduser "$user" "$group" >/dev/null
+  fi
+  acct_put "$user" "$group"
+  log "onboarded '$user'${group:+ in group '$group'}; no reload needed"
+}
+
+cmd_offboard() {
+  [ $# -eq 1 ] || usage
+  user=$1
+  require_name "user name" "$user"
+  protect_base_account "$user"
+
+  acquire_lock
+  if ! id "$user" >/dev/null 2>&1; then
+    if acct_known "$user"; then
+      acct_del "$user"
+      log "no unix user '$user'; removed its stale accounts.tsv line"
+      return 0
+    fi
+    die "no such user '$user'"
+  fi
+
+  smbpasswd -d "$user" >/dev/null 2>&1 || warn "could not disable '$user' in passdb"
+
+  # Disabling only blocks the NEXT authentication, so cut what is already open.
+  # kill-client-ip is per IP, not per user: other sessions from the same address
+  # are dropped too (they reconnect). Documented in docs/runtime-operations.md.
+  for ip in $(smbstatus -b 2>/dev/null | awk -v u="$user" '$2 == u { print $4 }' | sort -u); do
+    smbcontrol all kill-client-ip "$ip" >/dev/null 2>&1 \
+      && log "cut live sessions from $ip" \
+      || warn "could not cut sessions from $ip"
+  done
+
+  smbpasswd -x "$user" >/dev/null 2>&1 || warn "could not delete '$user' from passdb"
+  deluser "$user" >/dev/null 2>&1 || warn "could not delete unix user '$user'"
+  acct_del "$user"
+  log "offboarded '$user'"
+}
+
+cmd_sharepoint_create() {
+  [ $# -eq 1 ] || usage
+  name=$1
+  # 26, not 32: "sp_" + name + "_r" must itself stay a valid 32-char group name.
+  require_name "sharepoint name" "$name" 26
+
+  acquire_lock
+  ! section_present "$name" || die "a share named '$name' is already declared"
+
+  # Must happen inside the container: creating the directory over SMB with the
+  # client CLI produces mode 0000 on the host (analyze-new-requirement.md §3).
+  dir="$SHARE_ROOT/$name"
+  [ -d "$SHARE_ROOT" ] || die "share root $SHARE_ROOT does not exist"
+  mkdir -p "$dir"
+  chown "$WRITE_USER:$BASE_GROUP" "$dir" 2>/dev/null \
+    || warn "could not chown $dir (expected on a volume mounted with noowners)"
+  chmod "$DIRECTORY_MASK" "$dir" 2>/dev/null || warn "could not chmod $dir"
+
+  # mkdir runs as root here, so the new directory is root-owned until the chown  above succeeds.
+  # If the mount honours ownership and that chown failed, the forced user has no write bit (mode 0775, other = r-x) and the sharepoint would be silently read-only.
+  # Same probe entrypoint.sh runs for the static shares.
+  su -s /bin/sh -c "touch '$dir/.smb_write_probe' && rm -f '$dir/.smb_write_probe'" "$WRITE_USER" 2>/dev/null \
+    || warn "'$WRITE_USER' cannot write to $dir: the sharepoint is read-only at the filesystem level regardless of SMB permissions; fix host ownership of $SHARE_ROOT"
+
+  ensure_group "sp_${name}_r"
+  ensure_group "sp_${name}_w"
+
+  { cat "$DYNAMIC" 2>/dev/null || true; share_block "$name"; } | commit_dynamic "$name" "$dir"
+  reload_samba
+  log "sharepoint '$name' ready at $dir; grant access with: smbctl grant <user> $name r|rw"
+}
+
+cmd_grant() {
+  [ $# -eq 3 ] || usage
+  user=$1; share=$2; mode=$3
+  require_name "user name" "$user"
+  require_name "sharepoint name" "$share" 26
+  case $mode in r | rw) ;; *) die "mode must be 'r' or 'rw', got '$mode'" ;; esac
+
+  acquire_lock
+  id "$user" >/dev/null 2>&1 || die "no such unix user '$user'; run: smbctl onboard $user <password>"
+  section_present "$share" || die "no share named '$share'"
+  read_group="sp_${share}_r"; write_group="sp_${share}_w"
+  getent group "$read_group" >/dev/null 2>&1 && getent group "$write_group" >/dev/null 2>&1 \
+    || die "share '$share' has no $read_group/$write_group groups; it was not created by smbctl"
+
+  groups=$(acct_groups "$user")
+  in_group "$user" "$read_group" || adduser "$user" "$read_group" >/dev/null
+  groups=$(list_add "$groups" "$read_group")
+
+  if [ "$mode" = rw ]; then
+    in_group "$user" "$write_group" || adduser "$user" "$write_group" >/dev/null
+    groups=$(list_add "$groups" "$write_group")
+  else
+    # Explicit downgrade, so `grant r` after `grant rw` means read-only.
+    if in_group "$user" "$write_group"; then
+      gpasswd -d "$user" "$write_group" >/dev/null 2>&1 \
+        || warn "could not remove '$user' from $write_group"
+    fi
+    groups=$(list_del "$groups" "$write_group")
+  fi
+
+  acct_put "$user" "$groups"
+  # Group membership is evaluated per connection, so no reload and no restart.
+  log "granted '$user' $mode on '$share'; no reload needed"
+}
+
+cmd_revoke() {
+  [ $# -ge 2 ] && [ $# -le 3 ] || usage
+  user=$1; share=$2; mode=${3:-w}
+  require_name "user name" "$user"
+  require_name "sharepoint name" "$share" 26
+  case $mode in w | all) ;; *) die "mode must be 'w' (drop write) or 'all' (drop both), got '$mode'" ;; esac
+
+  acquire_lock
+  id "$user" >/dev/null 2>&1 || die "no such unix user '$user'"
+  read_group="sp_${share}_r"; write_group="sp_${share}_w"
+
+  groups=$(acct_groups "$user")
+  targets=$write_group
+  [ "$mode" != all ] || targets="$write_group $read_group"
+  for group in $targets; do
+    if in_group "$user" "$group"; then
+      # busybox `deluser USER GROUP` is not supported in this image; gpasswd is
+      # from the shadow package, which is present.
+      gpasswd -d "$user" "$group" >/dev/null 2>&1 || warn "could not remove '$user' from $group"
+    fi
+    groups=$(list_del "$groups" "$group")
+  done
+
+  acct_put "$user" "$groups"
+  if [ "$mode" = all ]; then
+    log "revoked all access of '$user' on '$share'"
+  else
+    log "revoked write access of '$user' on '$share' (read access kept)"
+  fi
+}
+
+cmd_state_dump() {
+  echo "# ===== $DYNAMIC ====="
+  cat "$DYNAMIC" 2>/dev/null || echo "# (missing)"
+  echo "# ===== $ACCOUNTS ====="
+  cat "$ACCOUNTS" 2>/dev/null || echo "# (missing)"
+}
+
+main() {
+  [ $# -ge 1 ] || usage
+  command=$1
+  shift
+  mkdir -p "$STATE_DIR"
+  case $command in
+    onboard)            cmd_onboard "$@" ;;
+    offboard)           cmd_offboard "$@" ;;
+    sharepoint-create)  cmd_sharepoint_create "$@" ;;
+    grant)              cmd_grant "$@" ;;
+    revoke)             cmd_revoke "$@" ;;
+    state-dump)         cmd_state_dump "$@" ;;
+    -h | --help | help) usage ;;
+    *)                  die "unknown command '$command'; run smbctl --help" ;;
+  esac
+}
+
+main "$@"

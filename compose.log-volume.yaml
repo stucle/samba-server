@@ -1,0 +1,12 @@
+# Compose overlay that writes Samba logs to a named volume,
+# used as the fallback when SMB_LOG_HOST_PATH is empty, unwritable, or the bind mount fails during "up". Selected automatically by smb.sh.
+services:
+  samba:
+    volumes:
+      - type: volume
+        source: samba_log
+        target: ${SMB_LOG_DIR:?}
+
+volumes:
+  samba_log:
+    name: ${SMB_LOG_VOLUME:-samba_log}
