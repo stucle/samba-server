@@ -1,0 +1,5 @@
+/home/ec2-user ec2-user:ec2-user 710   (g+x only: lets reader/groot traverse; AL2023 default is 700)
+/home/ec2-user/samba ec2-user:ec2-user 770
+/home/ec2-user/samba/log ec2-user:ec2-user 2775
+/home/ec2-user/samba/log/archived ec2-user:ec2-user 2775   (history; log files inside are 0640 root:ec2-user)
+/var/lib/samba-logroll root:root 0750   (roller state, outside the share)

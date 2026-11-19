@@ -1,0 +1,11 @@
+[Unit]
+Description=Run samba-logroll every CRON_LOG minutes and daily at ROLL_DAILY_AT (see guideline.md)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=@CRON_LOG@min
+OnCalendar=*-*-* @ROLL_DAILY_AT@:00
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+# Amazon Linux 2023 packages installed by setup.sh (dnf)
+samba                            # smb.service
+samba-common-tools               # testparm, pdbedit, smbpasswd
+samba-client                     # smbclient, for post-install check
+policycoreutils-python-utils     # semanage; only installed when SELinux is not Disabled
+
+# Reference: source host (maverick, Ubuntu 24.04) ran Samba 2:4.19.5+dfsg-4ubuntu9.8
+# Amazon Linux 2023 repo currently ships Samba 4.17.12 (older than the source)

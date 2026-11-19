@@ -1,0 +1,3 @@
+# Unix accounts backing the Samba users (supplementary group of both: ec2-user)
+reader:x:1001:1002::/home/reader:/usr/sbin/nologin
+groot:x:1002:1003::/home/groot:/usr/sbin/nologin

@@ -1,0 +1,6 @@
+[Unit]
+Description=Roll Samba logs (name-date-index.log, size capped) and prune old ones
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/samba-logroll
