@@ -1,0 +1,6 @@
+[Unit]
+Description=Roll Samba logs (current file in log/, archived/<prefix>-<date>-<index>.log) and prune old ones
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/samba-logroll

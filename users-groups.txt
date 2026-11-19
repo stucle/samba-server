@@ -1,0 +1,5 @@
+# Unix accounts backing the Samba users (supplementary group of both: ubuntu)
+# uid/gid are requested as fixed numbers; setup.sh falls back to system-assigned
+# ones if a number is already taken on the target host.
+reader:x:1001:1002::/home/reader:/usr/sbin/nologin
+groot:x:1002:1003::/home/groot:/usr/sbin/nologin

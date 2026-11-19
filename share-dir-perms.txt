@@ -1,0 +1,5 @@
+/home/ubuntu ubuntu:ubuntu 750   (Ubuntu cloud images already create it 0750; group x lets reader/groot traverse)
+/home/ubuntu/samba ubuntu:ubuntu 770
+/home/ubuntu/samba/log ubuntu:ubuntu 2775
+/home/ubuntu/samba/log/archived ubuntu:ubuntu 2775   (history; log files inside are 0640 root:ubuntu)
+/var/local/lib/samba-logroll root:root 0750   (roller state, outside the share)
