@@ -69,7 +69,7 @@ The container runs non-root (`uid 10001`, see `admin/Dockerfile`). On Docker Des
 
 ## Audit log
 
-`$CONTAINER_LOG_DIR/audit-YYYYMMDD.log` (by default `/var/log/samba`, mapped to `CONTAINER_LOG_HOST_PATH` = `/Volumes/RAMDisk/log/docker/samba`), one file per day in host time (`TZ=Asia/Ho_Chi_Minh`), append-only, JSON lines:
+`$CONTAINER_LOG_DIR/audit-YYYYMMDD.log` (by default `/var/log/samba`, mapped to `CONTAINER_LOG_HOST_PATH` = `/Volumes/RAMDisk/log/docker/samba`), one file per day in host time (`TZ=localdate-format`), append-only, JSON lines:
 
 ```json
 {"ts":"2026-11-03T15:20:01+07:00","actor":"groot","method":"POST","path":"/sharepoint","input":{"name":"alpha"},"result":"ok","detail":"[smbctl] sharepoint 'alpha' ready at /shares/onpremise/alpha"}
@@ -78,5 +78,5 @@ The container runs non-root (`uid 10001`, see `admin/Dockerfile`). On Docker Des
 - It sits next to Samba's own logs (`log.%m`, `log.smbd`, `container.log`) — reusing an existing mount, creating no new directory.
 - `401` and `400` requests are logged too (`actor` = the attempted user), but **never a password**: the `password` field is excluded from `input` in the handler itself, not filtered at write time.
 - Every line also goes to `docker logs smb-admin`, so a trace survives even if the file cannot be written.
-- **No rotation or retention of its own** — the same philosophy as the existing `smbd` logs. Pruning is manual.
+- **No rotation or retention of its own.** Unlike Samba's logs, it is not picked up by `archive_logs()` in `entrypoint.sh` (see [archiving](configuration.md#archiving)), which only handles `*.old` and `container.log`. Pruning this file is manual.
 - The audit log is not the only source for an investigation: cross-check it against the `smbd` logs when it matters.

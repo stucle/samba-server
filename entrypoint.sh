@@ -233,8 +233,7 @@ render_config() {
   SHARE_COUNT=$((i - 1))
 
   # Runtime-created shares, on the persistent samba_core volume.
-  # Must be the LAST line and outside [global]: `include` splices the file in at this point,
-  # so a [share] block in it would otherwise land inside the preceding section.
+  # Must be the LAST line and outside [global]: `include` splices the file in at this point,  so a [share] block in it would otherwise land inside the preceding section.
   # Samba's `include` does not glob — exactly one file. smbctl is the only writer and validates with testparm before replacing it, so it is never invalid here.
   echo "include = $SMB_STATE_DIR/dynamic.conf"
 }
@@ -245,8 +244,7 @@ set_password() {
   smbpasswd -e "$1" >/dev/null
 }
 
-# Mirrors this process's stdout/stderr into a file under CONTAINER_LOG_DIR,
-# in  addition to `docker logs`, so entrypoint messages and smbd's foreground output survive container restarts.
+# Mirrors this process's stdout/stderr into a file under CONTAINER_LOG_DIR, in  addition to `docker logs`, so entrypoint messages and smbd's foreground output survive container restarts.
 # Uses a fifo + tee instead of `exec >  >(...)` because this script runs under /bin/sh, which has no process substitution.
 setup_container_log() {
   fifo=/tmp/container-log.fifo
@@ -255,6 +253,39 @@ setup_container_log() {
   tee -a "$CONTAINER_LOG_DIR/container.log" < "$fifo" &
   exec > "$fifo" 2>&1
   rm -f "$fifo"
+}
+
+# Prints a free path SMB-<timestamp>-old.log under <dir>, adding .1, .2, ... on collision.
+archive_target() {
+  stamp=$(date +%Y%m%d-%H%M%S)
+  target="$1/SMB-$stamp-old.log"
+  n=1
+  while [ -e "$target" ]; do
+    target="$1/SMB-$stamp-old.$n.log"
+    n=$((n + 1))
+  done
+  echo "$target"
+}
+
+# Samba rotates a full log to <name>.old and keeps only ONE generation, so the previous .old is destroyed on the next rotation.
+# This moves each .old into $SMB_LOG_DIR/archived/SMB-<timestamp>-old.log  (uncompressed) before that happens, which is what makes SMB_MAX_LOG_SIZE a retention knob rather than a cap.
+#
+# container.log is written by tee, not by Samba, so nothing rotates it: once it exceeds SMB_MAX_LOG_SIZE (KB) it is copied into the same folder and truncated in place.
+# Truncating instead of mv is required because tee -a holds the file open with O_APPEND —  an mv would leave tee writing to an unlinked inode and the new file would stay empty.
+archive_logs() {
+  archive_dir="$SMB_LOG_DIR/archived"
+  mkdir -p "$archive_dir"
+  for old in "$SMB_LOG_DIR"/*.old; do
+    [ -f "$old" ] || continue
+    mv "$old" "$(archive_target "$archive_dir")"
+  done
+
+  container_log="$CONTAINER_LOG_DIR/container.log"
+  if [ -f "$container_log" ] \
+    && [ "$(stat -c %s "$container_log")" -gt $((${SMB_MAX_LOG_SIZE:-10240} * 1024)) ]; then
+    target=$(archive_target "$archive_dir")
+    cp "$container_log" "$target" && : > "$container_log"
+  fi
 }
 
 main() {
@@ -281,6 +312,10 @@ main() {
   set_password "$SMB_WRITE_USER" "$SMB_WRITE_PASSWORD"
   set_password "$SMB_READ_USER" "$SMB_READ_PASSWORD"
   log "ready: writer=${SMB_WRITE_USER}, reader=${SMB_READ_USER}, port=445, shares=${SHARE_COUNT}"
+  # Archive before smbd starts, then every 5 minutes: the loop is the only rotation/retention
+  # mechanism in the stack, and it must outlive nothing — it is a child of PID 1, so it dies with the container.
+  archive_logs || warn "archive_logs failed"
+  ( while sleep 300; do archive_logs || true; done ) &
   exec smbd --foreground --no-process-group
 }
 
