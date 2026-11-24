@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Rebuilds the maverick Samba server config on Ubuntu.
-# Run as root (sudo) from anywhere; safe to re-run (idempotent):
+# Rebuilds the maverick Samba server config on Ubuntu. Run as root (sudo) from anywhere; safe to re-run (idempotent):
 #   - config files are only rewritten when their content changed
 #   - the Samba user DB (passdb.tdb/secrets.tdb) is restored ONLY on first
 #     install; if it already exists it is never touched, so users managed by
@@ -25,17 +24,17 @@ SHARE_HOME=$(getent passwd "$SHARE_USER" | cut -d: -f6) || true
 [[ "$SHARE_HOME" == /home/ubuntu ]] || die "user $SHARE_USER not found or home is not /home/ubuntu (smb.conf hard-codes it)"
 SHARE_DIR=$SHARE_HOME/samba
 SVC=smbd
-# Roller state. /usr/local is for locally-installed software, and on Debian/Ubuntu
-# /var/local is where its variable data belongs; /var/lib/samba* is the samba
-# package's namespace. See guideline.md > Logging.
+# Roller state: See guideline.md > Logging
+#  - /usr/local is for locally-installed software,
+#  - and on Debian/Ubuntu  /var/local is where its variable data belongs;
+#  - /var/lib/samba* is the samba package's namespace.
 LOGROLL_STATE_DIR=/var/local/lib/samba-logroll
 PRIV=/var/lib/samba/private
 STAMP=$(date +%Y%m%d%H%M%S)
 RESTART_NEEDED=0
 LAST_CHANGED=0
 
-# install_if_changed SRC DST [restart] [MODE]  -> installs root:root (default 0644), backs up the old file;
-# with a 3rd arg "restart" a change also schedules a restart of smbd
+# install_if_changed SRC DST [restart] [MODE]  -> installs root:root (default 0644), backs up the old file; with a 3rd arg "restart" a change also schedules a restart of smbd
 install_if_changed() {
   local src=$1 dst=$2 restart=${3:-} mode=${4:-0644}
   LAST_CHANGED=0
@@ -76,28 +75,24 @@ usermod -aG "$SHARE_USER" reader
 usermod -aG "$SHARE_USER" groot
 
 echo "== share + log directories =="
-# Ubuntu cloud images create /home/ubuntu as 0750, so group x is already there;
-# this is a guard in case the host was built differently. reader/groot are in group ubuntu
-# and need to traverse it (traverse only, not listing).
+# Ubuntu cloud images create /home/ubuntu as 0750, so group x is already there; this is a guard in case the host was built differently.
+# reader/groot are in group ubuntu and need to traverse it (traverse only, not listing).
 chmod g+x "$SHARE_HOME"
 install -d -m 0770 -o "$SHARE_USER" -g "$SHARE_USER" "$SHARE_DIR"
 install -d -m 2775 -o "$SHARE_USER" -g "$SHARE_USER" "$SHARE_DIR/log"
 # current log files live in log/, everything the roller archives goes to log/archived/
 install -d -m 2775 -o "$SHARE_USER" -g "$SHARE_USER" "$SHARE_DIR/log/archived"
 # roller state (day the current file was started, stale-fd marker) - kept outside the share.
-# /var/local itself is left exactly as Ubuntu ships it (2775 root:staff); it is only
-# created if a minimal image lacks it. The state dir inherits that setgid bit from its
-# parent (install -d lets it through, and a numeric chmod mode does not clear setgid on a
-# directory), so it is cleared explicitly on the state dir only.
+# /var/local itself is left exactly as Ubuntu ships it (2775 root:staff);
+# it is only created if a minimal image lacks it. The state dir inherits that setgid bit from its parent (install -d lets it through, and a numeric chmod mode does not clear setgid on a directory),
+# so it is cleared explicitly on the state dir only.
 [[ -d $(dirname "$LOGROLL_STATE_DIR") ]] || install -d -m 2775 -o root -g staff "$(dirname "$LOGROLL_STATE_DIR")"
 install -d -m 0750 -o root -g root "$LOGROLL_STATE_DIR"
 chmod g-s "$LOGROLL_STATE_DIR"
 
 echo "== AppArmor =="
-# No SELinux on Ubuntu. Ubuntu's samba package ships no enabled smbd profile
-# (that is apparmor-profiles-extra), so normally there is nothing to do - but if a
-# profile IS loaded, a share outside /var/lib/samba needs an explicit rule.
-# This script only reports it; it never edits AppArmor policy.
+# No SELinux on Ubuntu. Ubuntu's samba package ships no enabled smbd profile (that is apparmor-profiles-extra), so normally there is nothing to do - but if a profile IS loaded,
+# a share outside /var/lib/samba needs an explicit rule. This script only reports it; it never edits AppArmor policy.
 if command -v aa-status >/dev/null 2>&1 && aa-status --enabled 2>/dev/null; then
   if aa-status 2>/dev/null | grep -qE '^\s+/usr/sbin/smbd$'; then
     warn "an AppArmor profile for /usr/sbin/smbd is loaded (enforce or complain mode)."
@@ -145,8 +140,7 @@ if [[ -e /etc/logrotate.d/samba-custom ]]; then
   mv /etc/logrotate.d/samba-custom "/root/samba-custom.logrotate.removed.$STAMP"
   echo "  moved old /etc/logrotate.d/samba-custom to /root/samba-custom.logrotate.removed.$STAMP"
 fi
-# Ubuntu's samba package ships /etc/logrotate.d/samba for /var/log/samba/*.log only;
-# it does not touch this share's log dir, so it is left alone.
+# Ubuntu's samba package ships /etc/logrotate.d/samba for /var/log/samba/*.log only; it does not touch this share's log dir, so it is left alone.
 cat > "$LOGROLL_CONF_TMP" <<EOF
 # generated by setup.sh from the kit-only keys in smb.conf - do not edit by hand
 LOG_DIR=$SHARE_DIR/log

@@ -5,19 +5,14 @@
 #   archived:  <LOG_DIR>/archived/<prefix>-<YYYYMMDD>-<index>.log
 #
 # Two log streams share the same folder and the same logic:
-#   samba   written by smbd; smbd always opens <LOG_DIR>/<SAMBA_PREFIX>.log
-#           (the unit to signal is SMB_SERVICE in the conf: smbd on Ubuntu)
+#   samba   written by smbd; smbd always opens <LOG_DIR>/<SAMBA_PREFIX>.log  (the unit to signal is SMB_SERVICE in the conf: smbd on Ubuntu)
 #   rotate  this script's own activity log (archiving, reloads, pruning)
 #
-# Rule: keep appending to <prefix>.log until it reaches the cap, or until the day
-# it was started is no longer today; then move it to archived/ under the day it
-# was STARTED, with the next free index for that day, and create a fresh empty
-# <prefix>.log. smbd is told to reopen its log with `smbcontrol all reload-config`.
+# Rule: keep appending to <prefix>.log until it reaches the cap, or until the day it was started is no longer today;
+# then move it to archived/ under the day it was STARTED, with the next free index for that day, and create a fresh empty <prefix>.log. smbd is told to reopen its log with `smbcontrol all reload-config`.
 # Nothing in archived/ is ever written to again, so pruning there is safe.
 #
-# Files in archived/ older than KEEP_DAYS are deleted. Run by samba-logroll.timer
-# every CRON_LOG minutes (smb.conf kit key), so a file can overshoot the cap by up
-# to CRON_LOG minutes of logging.
+# Files in archived/ older than KEEP_DAYS are deleted. Run by samba-logroll.timer every CRON_LOG minutes (smb.conf kit key), so a file can overshoot the cap by up to CRON_LOG minutes of logging.
 set -euo pipefail
 
 CONF=${LOGROLL_CONF:-/etc/samba/logroll.conf}
@@ -54,9 +49,8 @@ started_day() {
 
 set_started_day() { printf '%s\n' "$2" > "$STATE_DIR/$1.day"; }
 
-# effective_day PREFIX DAY -> DAY, but re-baselined to today when the current file is
-# empty: an empty file holds nothing from the older day, so filing it under that day
-# (and the content written to it today) would misattribute the archive.
+# effective_day PREFIX DAY -> DAY, but re-baselined to today when the current file is empty: an empty file holds nothing from the older day,
+# so filing it under that day (and the content written to it today) would misattribute the archive.
 effective_day() {
   if (( $(size_of "$LOG_DIR/$1.log") == 0 )) && [[ $2 != "$TODAY" ]]; then
     set_started_day "$1" "$TODAY"; echo "$TODAY"
