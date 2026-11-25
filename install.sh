@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Rebuilds the maverick Samba server config on Ubuntu. Run as root (sudo) from anywhere; safe to re-run (idempotent):
+# Puts the maverick Samba server config on disk (Debian/Ubuntu). Run as root (sudo) from anywhere; safe to re-run.
+# It does NOT restart or start smbd (it only stops it before restoring the user DB): run restart.sh afterwards.
 #   - config files are only rewritten when their content changed
-#   - the Samba user DB (passdb.tdb/secrets.tdb) is restored ONLY on first
-#     install; if it already exists it is never touched, so users managed by
-#     the onboard/offboard scripts are preserved.
+#   - to-copy/manifest.json lists the plain files copied to the host (drop-in, user DB);
+#      the user DB (passdb.tdb/secrets.tdb) is guarded: it is restored only while the host has no Samba users, so users managed by hand (onboard/offboard) are preserved.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -11,33 +11,35 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 warn() { echo "WARN:  $*" >&2; }
 
 [[ $EUID -eq 0 ]] || die "run as root: sudo bash $0"
-# shellcheck disable=SC1091
-. /etc/os-release
-[[ "${ID:-}" == ubuntu ]] || die "Ubuntu only (found: ${PRETTY_NAME:-unknown})"
-case "${VERSION_ID:-}" in
-  22.04|24.04) ;;
-  *) die "tested on Ubuntu 22.04 and 24.04 only (found: ${VERSION_ID:-unknown}); extend this check deliberately" ;;
-esac
 
-SHARE_USER=ubuntu
+# Share owner. Its home holds the share (<home>/samba) and a group of the same name owns it.
+# Default = kit key SHARE_USER in smb.conf (ubuntu). Override for one host: sudo bash install.sh --share-user ubuntu
+kit_key() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" smb.conf | sed 's/[[:space:]]*$//'; }
+SHARE_USER_OPT=${SHARE_USER:-}
+while (($#)); do
+  case $1 in
+    --share-user) SHARE_USER_OPT=${2:-}; [[ -n $SHARE_USER_OPT ]] || die "--share-user needs a user name"; shift 2 ;;
+    *) die "unknown option: $1 (only --share-user NAME)" ;;
+  esac
+done
+SHARE_USER=${SHARE_USER_OPT:-$(kit_key SHARE_USER)}
+[[ $SHARE_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || die "SHARE_USER '$SHARE_USER' is not a valid account name"
 SHARE_HOME=$(getent passwd "$SHARE_USER" | cut -d: -f6) || true
-[[ "$SHARE_HOME" == /home/ubuntu ]] || die "user $SHARE_USER not found or home is not /home/ubuntu (smb.conf hard-codes it)"
+[[ -n $SHARE_HOME && $SHARE_HOME == /home/* && $SHARE_HOME =~ ^/home/[A-Za-z0-9._-]+$ ]] || die "user $SHARE_USER not found, or its home ('$SHARE_HOME') is not /home/<name>"
+getent group "$SHARE_USER" >/dev/null || die "group $SHARE_USER not found (the share is owned by group $SHARE_USER)"
 SHARE_DIR=$SHARE_HOME/samba
+echo "share: $SHARE_DIR (owner/group $SHARE_USER)"
 SVC=smbd
-# Roller state: See guideline.md > Logging
+# Roller state: See documentation/guideline.md > Logging
 #  - /usr/local is for locally-installed software,
 #  - and on Debian/Ubuntu  /var/local is where its variable data belongs;
 #  - /var/lib/samba* is the samba package's namespace.
 LOGROLL_STATE_DIR=/var/local/lib/samba-logroll
-PRIV=/var/lib/samba/private
 STAMP=$(date +%Y%m%d%H%M%S)
-RESTART_NEEDED=0
-LAST_CHANGED=0
 
-# install_if_changed SRC DST [restart] [MODE]  -> installs root:root (default 0644), backs up the old file; with a 3rd arg "restart" a change also schedules a restart of smbd
+# install_if_changed SRC DST [MODE]  -> installs root:root (default 0644), backs up the old file
 install_if_changed() {
-  local src=$1 dst=$2 restart=${3:-} mode=${4:-0644}
-  LAST_CHANGED=0
+  local src=$1 dst=$2 mode=${3:-0644}
   if [[ -e $dst ]] && cmp -s "$src" "$dst"; then
     echo "  unchanged: $dst"
     return 0
@@ -45,12 +47,70 @@ install_if_changed() {
   [[ -e $dst ]] && cp -a "$dst" "$dst.bak.$STAMP" && echo "  backup:    $dst.bak.$STAMP"
   install -m "$mode" -o root -g root "$src" "$dst"
   echo "  installed: $dst"
-  LAST_CHANGED=1
-  [[ -z $restart ]] || RESTART_NEEDED=1
+}
+
+# --- to-copy/manifest.json -------------------------------------------------------
+# manifest.py validates the whole file and flattens it to TSV; nothing is touched if it is invalid.
+# guard_<name>  : returns 0 = apply the entries of this unit, 1 = skip them (not an error).
+# pre_<guard>   : runs once, right before the first entry of a unit that passed its guard is replaced.
+# verify_<name> : run after the unit was copied; failure -> files moved aside, install stops.
+guard_samba_passdb_no_users() {
+  # no passdb.tdb, or one without users (apt starts smbd after install and creates an empty one) -> restore.
+  # A passdb that exists but cannot be read is never touched blind.
+  [[ -e /var/lib/samba/private/passdb.tdb ]] || return 0
+  # stdout only: pdbedit prints noise ("added interface ...") on stderr, which must not make an empty passdb look like it has users
+  local users err rc=0
+  err=$(mktemp)
+  users=$(pdbedit -L 2>"$err") || rc=$?
+  if ((rc)); then users=$(<"$err"); rm -f "$err"; die "/var/lib/samba/private/passdb.tdb exists but pdbedit cannot read it - not touching it, check by hand: $users"; fi
+  rm -f "$err"
+  if [[ -z $users ]]; then return 0; fi
+  echo "  passdb.tdb already has users -> keeping them (no restore)"
+  return 1
+}
+pre_samba_passdb_no_users() { systemctl stop "$SVC" 2>/dev/null || true; }
+verify_samba_passdb_readable() {
+  pdbedit -L >/dev/null 2>&1 || return 1
+  echo "  restored. Samba users:"; pdbedit -L 2>/dev/null | sed 's/^/    /'
+}
+
+apply_manifest() {
+  local rows fn sp dest mode owner dmode ow bk guard verify grp un i key dst f
+  rows=$(python3 -I manifest.py to-copy/manifest.json) || die "to-copy/manifest.json is invalid; nothing was copied"
+  local -A U_SKIP U_CHANGED U_VERIFY U_FILES U_PRE
+  local -a ORDER=()
+  i=0
+  while IFS=$'\t' read -r fn sp dest mode owner dmode ow bk guard verify grp un; do
+    i=$((i+1))
+    key=$grp; [[ $grp != - ]] || key="entry$i"
+    if [[ -z ${U_SKIP[$key]+x} ]]; then
+      ORDER+=("$key"); U_CHANGED[$key]=0; U_VERIFY[$key]=$verify; U_FILES[$key]=""; U_PRE[$key]=0; U_SKIP[$key]=0
+      if [[ $guard != - ]] && ! "guard_${guard//-/_}"; then U_SKIP[$key]=1; fi
+    fi
+    dst=$dest/$fn
+    if [[ ${U_SKIP[$key]} -eq 1 ]]; then echo "  skipped (guard $guard): $dst"; continue; fi
+    if [[ -e $dst ]]; then
+      if [[ $ow == ifAbsent ]]; then echo "  exists, kept: $dst"; continue; fi
+      if [[ $ow == ifChanged ]] && cmp -s "$sp" "$dst"; then echo "  unchanged: $dst"; continue; fi
+    fi
+    if [[ $guard != - && ${U_PRE[$key]} -eq 0 ]]; then "pre_${guard//-/_}"; U_PRE[$key]=1; fi
+    [[ -d $dest ]] || install -d -m "$dmode" -o "${owner%%:*}" -g "${owner##*:}" "$dest"
+    if [[ -e $dst && $bk == 1 ]]; then cp -a "$dst" "$dst.bak.$STAMP"; echo "  backup:    $dst.bak.$STAMP"; fi
+    install -m "$mode" -o "${owner%%:*}" -g "${owner##*:}" "$sp" "$dst"
+    echo "  installed: $dst"
+    U_CHANGED[$key]=1; U_FILES[$key]+="$dst "
+  done <<<"$rows"
+  for key in "${ORDER[@]}"; do
+    [[ ${U_CHANGED[$key]} -eq 1 && ${U_VERIFY[$key]} != - ]] || continue
+    if ! "verify_${U_VERIFY[$key]//-/_}"; then
+      for f in ${U_FILES[$key]}; do mv "$f" "$f.failed.$STAMP"; done
+      die "${U_VERIFY[$key]} failed after copying (${U_FILES[$key]}); moved aside as *.failed.$STAMP. Re-create users with smbpasswd -a, then re-run."
+    fi
+  done
 }
 
 echo "== installing samba =="
-PKGS=(samba samba-common-bin smbclient)
+PKGS=(samba samba-common-bin smbclient python3)   # python3: reads to-copy/manifest.json (manifest.py)
 MISSING=()
 for p in "${PKGS[@]}"; do
   dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || MISSING+=("$p")
@@ -108,12 +168,12 @@ fi
 
 echo "== smb.conf =="
 # Kit-only keys in smb.conf (KEY = value): read them, substitute @KEY@ placeholders, strip the key lines.
-kit_key() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" smb.conf | sed 's/[[:space:]]*$//'; }
-KIT_KEYS=(HOSTS_ALLOW SAMBA_LOG_PREFIX SAMBA_LOG_MAX_MB ROTATE_LOG_PREFIX ROTATE_LOG_MAX_MB LOG_KEEP_DAYS CRON_LOG ROLL_DAILY_AT)
+KIT_KEYS=(SHARE_USER HOSTS_ALLOW SAMBA_LOG_PREFIX SAMBA_LOG_MAX_MB ROTATE_LOG_PREFIX ROTATE_LOG_MAX_MB LOG_KEEP_DAYS CRON_LOG ROLL_DAILY_AT)
 declare -A KV
-SED_ARGS=()
+SED_ARGS=(-e "s|@SHARE_DIR@|$SHARE_DIR|g")   # derived from SHARE_USER, not a key in smb.conf
 for k in "${KIT_KEYS[@]}"; do
   KV[$k]=$(kit_key "$k")
+  [[ $k == SHARE_USER ]] && KV[$k]=$SHARE_USER   # --share-user / env override wins over the smb.conf default
   [[ -n "${KV[$k]}" ]] || die "$k not set in smb.conf"
   SED_ARGS+=(-e "/^[[:space:]]*$k[[:space:]]*=/d" -e "s|@$k@|${KV[$k]}|g")
 done
@@ -132,7 +192,7 @@ trap 'rm -f "$RENDERED" "$LOGROLL_CONF_TMP" "$TIMER_TMP"' EXIT
 sed "${SED_ARGS[@]}" smb.conf > "$RENDERED"
 grep -q '@[A-Z_]*@' "$RENDERED" && die "unresolved placeholder in rendered smb.conf"
 testparm -s "$RENDERED" >/dev/null 2>&1 || { testparm -s "$RENDERED" >&2 || true; die "rendered smb.conf is invalid"; }
-install_if_changed "$RENDERED" /etc/samba/smb.conf restart
+install_if_changed "$RENDERED" /etc/samba/smb.conf
 
 echo "== log rolling (current file in log/, archived/<prefix>-<date>-<index>.log) =="
 # replaces any earlier logrotate setup; move it away if one was installed
@@ -142,7 +202,7 @@ if [[ -e /etc/logrotate.d/samba-custom ]]; then
 fi
 # Ubuntu's samba package ships /etc/logrotate.d/samba for /var/log/samba/*.log only; it does not touch this share's log dir, so it is left alone.
 cat > "$LOGROLL_CONF_TMP" <<EOF
-# generated by setup.sh from the kit-only keys in smb.conf - do not edit by hand
+# generated by install.sh from the kit-only keys in smb.conf - do not edit by hand
 LOG_DIR=$SHARE_DIR/log
 ARCHIVE_DIR=$SHARE_DIR/log/archived
 STATE_DIR=$LOGROLL_STATE_DIR
@@ -155,58 +215,17 @@ KEEP_DAYS=${KV[LOG_KEEP_DAYS]}
 OWNER_GROUP=$SHARE_USER
 EOF
 install_if_changed "$LOGROLL_CONF_TMP" /etc/samba/logroll.conf
-install_if_changed samba-logroll.sh      /usr/local/sbin/samba-logroll "" 0755
-install_if_changed samba-logroll.service /etc/systemd/system/samba-logroll.service
-sed -e "s|@CRON_LOG@|${KV[CRON_LOG]}|g" -e "s|@ROLL_DAILY_AT@|${KV[ROLL_DAILY_AT]}|g" samba-logroll.timer > "$TIMER_TMP"
-grep -q '@[A-Z_]*@' "$TIMER_TMP" && die "unresolved placeholder in samba-logroll.timer"
+install_if_changed logroll/samba-logroll.sh      /usr/local/sbin/samba-logroll 0755
+install_if_changed logroll/samba-logroll.service /etc/systemd/system/samba-logroll.service
+sed -e "s|@CRON_LOG@|${KV[CRON_LOG]}|g" -e "s|@ROLL_DAILY_AT@|${KV[ROLL_DAILY_AT]}|g" logroll/samba-logroll.timer > "$TIMER_TMP"
+grep -q '@[A-Z_]*@' "$TIMER_TMP" && die "unresolved placeholder in logroll/samba-logroll.timer"
 install_if_changed "$TIMER_TMP" /etc/systemd/system/samba-logroll.timer
-TIMER_CHANGED=$LAST_CHANGED
 
-echo "== systemd drop-in =="
-install -d /etc/systemd/system/smbd.service.d
-install_if_changed etc-systemd-smbd-dropin/limits.conf /etc/systemd/system/smbd.service.d/limits.conf restart
-
-echo "== samba user/password DB =="
-install -d -m 0700 -o root -g root "$PRIV"
-if [[ -e $PRIV/passdb.tdb ]]; then
-  echo "  passdb.tdb already exists -> keeping existing users (no restore)"
-else
-  systemctl stop "$SVC" 2>/dev/null || true
-  # a secrets.tdb auto-created by an earlier start must not mix with the restored passdb
-  [[ -e $PRIV/secrets.tdb ]] && mv "$PRIV/secrets.tdb" "$PRIV/secrets.tdb.bak.$STAMP"
-  tar -C "$PRIV" --no-same-owner -xf var-lib-samba-private/private.tar passdb.tdb secrets.tdb
-  chown root:root "$PRIV/passdb.tdb" "$PRIV/secrets.tdb"
-  chmod 600 "$PRIV/passdb.tdb" "$PRIV/secrets.tdb"
-  # The kit comes from Samba 4.19 (= Ubuntu 24.04). On 22.04 (4.15) verify it can read the DB
-  if pdbedit -L >/dev/null 2>&1; then
-    echo "  restored. Samba users:"; pdbedit -L | sed 's/^/    /'
-  else
-    mv "$PRIV/passdb.tdb"  "$PRIV/passdb.tdb.failed.$STAMP"
-    mv "$PRIV/secrets.tdb" "$PRIV/secrets.tdb.failed.$STAMP"
-    die "restored passdb is not readable by this Samba version; moved aside (*.failed.$STAMP). Re-create users with smbpasswd -a, then re-run."
-  fi
-  RESTART_NEEDED=1
-fi
-
-echo "== enable + start =="
-ip link show tailscale0 >/dev/null 2>&1 || warn "interface tailscale0 not found - Samba will only listen on loopback until Tailscale is up (then: systemctl restart $SVC)"
-systemctl daemon-reload
-systemctl enable "$SVC"
-/usr/local/sbin/samba-logroll        # creates log/<prefix>.log before smbd starts
-systemctl enable --now samba-logroll.timer
-if [[ $TIMER_CHANGED -eq 1 ]]; then systemctl restart samba-logroll.timer; echo "  samba-logroll.timer restarted (every ${KV[CRON_LOG]} min + daily at ${KV[ROLL_DAILY_AT]})"; fi
-if systemctl is-active --quiet "$SVC"; then
-  if [[ $RESTART_NEEDED -eq 1 ]]; then systemctl restart "$SVC"; echo "  restarted $SVC"; else echo "  $SVC already running, nothing changed"; fi
-else
-  systemctl start "$SVC"; echo "  started $SVC"
-fi
-systemctl is-enabled --quiet nmbd 2>/dev/null && warn "nmbd is enabled (NetBIOS name service, as the samba package set it). It honours the same 'interfaces'/'bind interfaces only', so it stays off the public NIC. Not needed by SMB over Tailscale: sudo systemctl disable --now nmbd"
-testparm -s 2>/dev/null | sed -n '/^\[global\]/,/^$/p' | grep -E 'hosts allow|interfaces|bind interfaces|log file|max log size' || true
+echo "== to-copy (manifest) =="
+apply_manifest
 
 cat <<'EOF'
 
-Done. Still manual:
-  1. Tailscale installed + joined to the tailnet (sudo tailscale up) - hosts allow relies on it.
-  2. Check the cloud firewall / security group - do not expose port 445 publicly.
-  3. Verify: smbclient -L localhost -U reader
+install.sh done - NOTHING IS LIVE YET: new config / drop-in / user DB are on disk, smbd still runs the old state.
+Next: sudo bash restart.sh   (daemon-reload, enable, restart smbd + log-roll timer)
 EOF

@@ -1,0 +1,33 @@
+[
+  {
+    "fileName": "limits.conf",
+    "sourcePath": "to-copy/limits.conf",
+    "destination": "/etc/systemd/system/smbd.service.d"
+  },
+  {
+    "fileName": "passdb.tdb",
+    "sourcePath": "to-copy/passdb.tdb",
+    "destination": "/var/lib/samba/private",
+    "mode": "0600",
+    "dirMode": "0700",
+    "overwrite": "always",
+    "backup": false,
+    "group": "samba-passdb",
+    "guard": "samba-passdb-no-users",
+    "verify": "samba-passdb-readable",
+    "uninstall": "purge"
+  },
+  {
+    "fileName": "secrets.tdb",
+    "sourcePath": "to-copy/secrets.tdb",
+    "destination": "/var/lib/samba/private",
+    "mode": "0600",
+    "dirMode": "0700",
+    "overwrite": "always",
+    "backup": false,
+    "group": "samba-passdb",
+    "guard": "samba-passdb-no-users",
+    "verify": "samba-passdb-readable",
+    "uninstall": "purge"
+  }
+]

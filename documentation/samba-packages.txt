@@ -1,0 +1,13 @@
+# Packages installed by install.sh (apt-get)
+samba                  # smbd.service, nmbd.service, smbcontrol (used by samba-logroll)
+samba-common-bin       # testparm, pdbedit, smbpasswd
+smbclient              # smbclient, for post-install check
+python3                # manifest.py (reads to-copy/manifest.json); uninstall.sh never removes it
+#
+# smbcontrol note: on 22.04 (4.15) and 24.04 (4.19) it lives in the `samba` package; upstream Debian moved it to samba-common-bin in 4.20.0-2 (Ubuntu 25.04+).
+#Both packages are installed here, so it is present either way.
+
+# Not installed: no SELinux tooling is needed on Ubuntu.
+# AppArmor is already present; install.sh only CHECKS whether a loaded smbd profile would block the share and warns.
+# Ubuntu's samba package ships no enabled smbd profile by default (that lives in apparmor-profiles-extra, which this kit does not install).
+#

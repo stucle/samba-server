@@ -1,3 +1,4 @@
+# Default SHARE_USER=ubuntu. With install.sh --share-user <name>, read /home/ubuntu as /home/<name> and ubuntu:ubuntu as <name>:<name>.
 /home/ubuntu ubuntu:ubuntu 750   (Ubuntu cloud images already create it 0750; group x lets reader/groot traverse)
 /home/ubuntu/samba ubuntu:ubuntu 770
 /home/ubuntu/samba/log ubuntu:ubuntu 2775

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run samba-logroll every CRON_LOG minutes and daily at ROLL_DAILY_AT (see guideline.md)
+Description=Run samba-logroll every CRON_LOG minutes and daily at ROLL_DAILY_AT (see documentation/guideline.md)
 
 [Timer]
 OnBootSec=30s
